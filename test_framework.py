@@ -1,6 +1,9 @@
 """Synthetic correctness tests; no MRSHaze images or GPU required."""
 import copy
+import importlib
+import json
 from argparse import Namespace
+from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
@@ -43,7 +46,7 @@ def tiny_config(root, destination):
     config['train'].update(gray_epochs=1, color_epochs=2, joint_epochs=1,
                            batch_size=2, num_workers=0, amp=False,
                            accumulation_steps=2, sar_dropout=0.2)
-    config.update(run_dir=str(destination), device='cpu')
+    config.update(run_dir=str(destination), device='cpu', mode='hybrid')
     return config
 
 
@@ -176,11 +179,76 @@ def test_tiled_coverage():
 
 def test_phase_plans():
     config = load_config('mrshaze.yaml')
+    assert config['mode'] == 'e2e'
+    assert len(phase_plan(config)) == 6
+    assert set(p[0] for p in phase_plan(config)) == {'joint'}
+    config['train'].update(gray_epochs=10, color_epochs=10, joint_epochs=80)
+    config['mode']='hybrid'
     assert len(phase_plan(config)) == 100
     config['mode']='e2e'
     assert set(p[0] for p in phase_plan(config)) == {'joint'}
     config['mode']='modular'
     assert phase_plan(config)[10][0] == 'color'
+
+
+@pytest.mark.parametrize('phase', ['train', 'validation', 'between_epochs'])
+def test_time_budget_preserves_resumable_checkpoint(dataset_root, tmp_path, monkeypatch, phase):
+    module = importlib.import_module('train')
+    config = tiny_config(dataset_root, tmp_path/'reference')
+    config['mode'] = 'e2e'
+    config['train'].update(gray_epochs=0, color_epochs=0, joint_epochs=2, max_hours=None)
+    train(config)
+    reference = load_checkpoint(tmp_path/'reference'/'last.pt')
+    config['run_dir'] = str(tmp_path/'limited')
+    config['train']['max_hours'] = 1
+    clock = {'now': 0.0, 'train_batches': 0}
+    original_forward = SARGrayColor.forward
+
+    def forward(model, *args, **kwargs):
+        output = original_forward(model, *args, **kwargs)
+        if model.training:
+            clock['train_batches'] += 1
+            if phase == 'train' and clock['train_batches'] == 4:
+                clock['now'] = 4000  # First batch of epoch two exceeds budget.
+            if phase == 'between_epochs' and clock['train_batches'] == 3:
+                clock['now'] = 2000  # Epoch one fits; another epoch would not.
+        elif phase == 'validation':
+            clock['now'] = 4000  # First validation image exceeds budget.
+        return output
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, 'time', SimpleNamespace(monotonic=lambda: clock['now']))
+        patch.setattr(SARGrayColor, 'forward', forward)
+        train(config)
+    limited = load_checkpoint(tmp_path/'limited'/'last.pt')
+    expected_epoch = 0 if phase == 'validation' else 1
+    assert limited['epoch'] == expected_epoch
+    status = json.loads((tmp_path/'limited'/'session_stop.json').read_text())
+    assert status['completed_epoch'] == expected_epoch
+    if phase == 'validation':
+        assert not (tmp_path/'limited'/'best.pt').exists()
+        assert not (tmp_path/'limited'/'metrics.jsonl').exists()
+    # Changing only the session budget is allowed, and resuming the preserved
+    # state must undo all effects of discarded batches/partial validation.
+    config['train']['max_hours'] = None
+    config['run_dir'] = str(tmp_path/'continued')
+    train(config, resume=tmp_path/'limited'/'last.pt')
+    continued = load_checkpoint(tmp_path/'continued'/'last.pt')
+    assert continued['epoch'] == reference['epoch'] == 2
+    for key in reference['model']:
+        torch.testing.assert_close(reference['model'][key], continued['model'][key], atol=0, rtol=0)
+    rows = (tmp_path/'continued'/'metrics.jsonl').read_text().splitlines()
+    assert len(rows) == 2
+    assert (tmp_path/'continued'/'best.pt').exists()
+
+
+@pytest.mark.parametrize('hours', [0, -1, float('inf'), float('nan'), True])
+def test_invalid_time_budget(hours):
+    from graytocolor.runtime import validate_config
+    config = load_config('mrshaze.yaml')
+    config['train']['max_hours'] = hours
+    with pytest.raises(ValueError, match='max_hours'):
+        validate_config(config)
 
 
 def test_training_resume_and_inference(dataset_root,tmp_path):

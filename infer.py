@@ -26,6 +26,8 @@ def save_image(tensor, path):
 def run(args):
     checkpoint = load_checkpoint(args.weights)
     config = checkpoint['config']
+    if checkpoint['epoch'] < 1:
+        raise ValueError('This is an epoch-zero restart checkpoint; no training epoch has completed.')
     if checkpoint['phase'] == 'gray':
         raise ValueError('This checkpoint has only trained structure recovery. Finish color/joint '
                          'training before evaluating RGB dehazing.')

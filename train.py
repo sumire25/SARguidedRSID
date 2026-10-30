@@ -5,6 +5,7 @@ import itertools
 import json
 import math
 import platform
+import shutil
 import time
 from pathlib import Path
 
@@ -51,10 +52,12 @@ def learning_rate(t, phase_epoch, phase_epochs, progress):
 
 
 @torch.inference_mode()
-def validate(model, loader, device, phase):
+def validate(model, loader, device, phase, deadline=None):
     model.eval()
     totals, count = {}, 0
     for batch in loader:
+        if deadline is not None and time.monotonic() >= deadline:
+            return None  # Partial validation must not select a best model.
         hazy, sar, gt = [batch[k].to(device) for k in ('hazy', 'sar', 'gt')]
         output = model(hazy, sar, structure_only=phase == 'gray')
         if phase == 'gray':
@@ -66,12 +69,17 @@ def validate(model, loader, device, phase):
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0) + value.sum().item()
         count += gt.shape[0]
+    if deadline is not None and time.monotonic() >= deadline:
+        return None
     return {key: value / count for key, value in totals.items()}
 
 
 def train(config, resume=None, init_weights=None, stop_after_epoch=None):
     """stop_after_epoch saves a complete epoch; total schedule stays unchanged."""
     validate_config(config)
+    session_started = time.monotonic()
+    hours = config['train'].get('max_hours')
+    deadline = session_started + hours * 3600 if hours is not None else None
     if resume and init_weights:
         raise ValueError('Use either --resume or --init-weights')
     seed_everything(config['seed'])
@@ -128,16 +136,67 @@ def train(config, resume=None, init_weights=None, stop_after_epoch=None):
         return
     if stop_after_epoch is not None and stop_after_epoch <= start_epoch:
         raise ValueError('--stop-after-epoch must exceed completed epoch count')
+    if checkpoint:
+        # New Kaggle sessions mount previous outputs read-only. Carry forward
+        # their history and best models, even if this session finds no new best.
+        source = Path(resume).parent
+        for name in ('best.pt', 'best_gray.pt', 'best_color.pt', 'best_joint.pt'):
+            old_path, new_path = source / name, run_dir / name
+            if old_path.is_file() and not new_path.exists():
+                old_best = load_checkpoint(old_path)
+                assert_resume_compatible(config, old_best['config'])
+                if old_best['epoch'] <= start_epoch and old_best['split'] == manifest:
+                    shutil.copy2(old_path, new_path)
+        history = source / 'metrics.jsonl'
+        destination = run_dir / 'metrics.jsonl'
+        if history.is_file() and not destination.exists():
+            for line in history.read_text().splitlines():
+                record = json.loads(line)
+                if record['epoch'] <= start_epoch:
+                    append_json(destination, record)
     metadata = {'torch': str(torch.__version__), 'python': platform.python_version(),
                 'device': str(device), 'parameters': sum(p.numel() for p in model.parameters()),
                 'train_images': len(train_ds), 'val_images': len(val_ds)}
     (run_dir / 'environment.json').write_text(json.dumps(metadata, indent=2) + '\n')
     print(json.dumps(metadata), flush=True)
     print(f'Schedule: {config["mode"]}; {len(plan)} epochs; test split is not used.', flush=True)
+    if hours is not None:
+        print(f'Session training budget: {hours:g} hours, including validation.', flush=True)
     if t['max_train_batches'] or t['max_val_images']:
         print('DEVELOPMENT SUBSET ENABLED: results are not a full-dataset benchmark.', flush=True)
     batches = min(len(loader), t['max_train_batches'] or len(loader))
+    completed_epoch = start_epoch
+    last_epoch_seconds = checkpoint.get('metrics', {}).get('seconds') if checkpoint else None
+
+    def checkpoint_state(epoch, phase, metrics):
+        return {'format_version': 1, 'config': copy.deepcopy(config), 'epoch': epoch,
+                'phase': phase, 'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
+                'scaler': scaler.state_dict(), 'best': best, 'split': manifest,
+                'rng': rng_state(generator), 'metrics': metrics}
+
+    # Copy a mounted resume checkpoint into the new session's output. An
+    # epoch-zero checkpoint allows restarting if the first epoch exceeds budget.
+    save_checkpoint(run_dir / 'last.pt', checkpoint_state(
+        start_epoch, checkpoint['phase'] if checkpoint else plan[0][0],
+        checkpoint.get('metrics', {}) if checkpoint else {}))
+
+    def stop_for_time(reason):
+        status = {'reason': reason, 'completed_epoch': completed_epoch,
+                  'elapsed_hours': (time.monotonic()-session_started)/3600,
+                  'resume_checkpoint': str(run_dir / 'last.pt')}
+        (run_dir / 'session_stop.json').write_text(json.dumps(status, indent=2) + '\n')
+        print(f'Time budget stop: {reason}. Preserved epoch {completed_epoch} in '
+              f'{run_dir}/last.pt; resume it in another Kaggle session.', flush=True)
+
     for epoch in range(start_epoch, len(plan)):
+        if deadline is not None:
+            remaining = deadline-time.monotonic()
+            # Prefer stopping between epochs, allowing 25% timing variation and
+            # one minute for writes. Batch/image checks cover slower epochs.
+            estimate = 1.25*last_epoch_seconds + 60 if last_epoch_seconds else 0
+            if remaining <= 0 or (estimate and remaining < estimate):
+                stop_for_time('insufficient time for another complete epoch')
+                return
         phase, phase_epoch, phase_epochs = plan[epoch]
         set_phase(model, phase)
         model.train()
@@ -150,6 +209,9 @@ def train(config, resume=None, init_weights=None, stop_after_epoch=None):
         teacher_ratio = (t['teacher_start'] * (1-phase_epoch/(phase_epochs-1))
                          if phase == 'color' and phase_epochs > 1 else 0.0)
         for batch_index, batch in enumerate(itertools.islice(loader, batches)):
+            if deadline is not None and time.monotonic() >= deadline:
+                stop_for_time('budget reached during training; incomplete epoch discarded')
+                return
             hazy, sar, gt = [batch[k].to(device, non_blocking=True)
                              for k in ('hazy', 'sar', 'gt')]
             available = torch.ones(hazy.shape[0], 1, 1, 1, device=device)
@@ -190,7 +252,13 @@ def train(config, resume=None, init_weights=None, stop_after_epoch=None):
                       f' loss={loss.item():.5f} lr={lr:.2e}', flush=True)
         boundary = epoch+1 == len(plan) or plan[epoch+1][0] != phase
         do_validation = (epoch+1) % t['val_every'] == 0 or boundary
-        validation = validate(model, val_loader, device, phase) if do_validation else {}
+        if deadline is not None and time.monotonic() >= deadline:
+            stop_for_time('budget reached before validation; incomplete epoch discarded')
+            return
+        validation = validate(model, val_loader, device, phase, deadline) if do_validation else {}
+        if validation is None:
+            stop_for_time('budget reached during validation; incomplete epoch discarded')
+            return
         metric_name = 'gray_psnr' if phase == 'gray' else 'psnr'
         improved = bool(validation) and validation[metric_name] > best.get(phase, -float('inf'))
         if improved:
@@ -201,16 +269,16 @@ def train(config, resume=None, init_weights=None, stop_after_epoch=None):
                   'train': {k: v/seen for k, v in totals.items()}, 'val': validation}
         append_json(run_dir / 'metrics.jsonl', record)
         print(json.dumps(record), flush=True)
-        state = {'format_version': 1, 'config': copy.deepcopy(config), 'epoch': epoch+1,
-                 'phase': phase, 'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
-                 'scaler': scaler.state_dict(), 'best': best, 'split': manifest,
-                 'rng': rng_state(generator), 'metrics': record}
+        state = checkpoint_state(epoch+1, phase, record)
         save_checkpoint(run_dir / 'last.pt', state)
         if improved:
             save_checkpoint(run_dir / f'best_{phase}.pt', state)
             # Final model selection uses the final scheduled phase only.
             if phase == plan[-1][0]:
                 save_checkpoint(run_dir / 'best.pt', state)
+        completed_epoch = epoch+1
+        last_epoch_seconds = time.monotonic()-started
+        print(f'Saved {run_dir}/last.pt (completed epoch {completed_epoch}).', flush=True)
         if stop_after_epoch is not None and epoch+1 >= stop_after_epoch:
             print(f'Stopped after completed epoch {epoch+1}; resume from {run_dir}/last.pt', flush=True)
             break
@@ -227,6 +295,7 @@ def parse_args():
     parser.add_argument('--init-weights', help='Start a new schedule from model weights only')
     parser.add_argument('--stop-after-epoch', type=int,
                         help='Absolute epoch count; preserves schedule for another Kaggle session')
+    parser.add_argument('--max-hours', type=float, help='Per-session training/validation time budget')
     return parser.parse_args()
 
 
@@ -238,4 +307,6 @@ if __name__ == '__main__':
             config[key] = getattr(args, key)
     if args.data_root:
         config['data']['root'] = args.data_root
+    if args.max_hours is not None:
+        config['train']['max_hours'] = args.max_hours
     train(config, args.resume, args.init_weights, args.stop_after_epoch)

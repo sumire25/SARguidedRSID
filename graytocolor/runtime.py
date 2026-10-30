@@ -32,6 +32,10 @@ def validate_config(c):
     for key in ('max_train_batches', 'max_val_images'):
         if t[key] is not None and (not isinstance(t[key], int) or t[key] < 1):
             raise ValueError(f'{key} must be a positive integer or null')
+    hours = t.get('max_hours')
+    if hours is not None and (not isinstance(hours, (int, float)) or isinstance(hours, bool)
+                              or not math.isfinite(hours) or hours <= 0):
+        raise ValueError('max_hours must be finite and positive or null')
     if sum(t[k] for k in ('gray_epochs', 'color_epochs', 'joint_epochs')) < 1:
         raise ValueError('At least one training epoch is required')
     if not 0 <= t['sar_dropout'] < 1 or not 0 <= t['teacher_start'] <= 1:
@@ -116,6 +120,7 @@ def assert_resume_compatible(current, saved):
             result.pop(key, None)
         result['data'].pop('root', None)  # Kaggle mount locations can change.
         result['train'].pop('num_workers', None)
+        result['train'].pop('max_hours', None)  # Per-session budget can change on resume.
         return result
     if comparable(current) != comparable(saved):
         raise ValueError('Resume settings differ from checkpoint. Use its config, or '
