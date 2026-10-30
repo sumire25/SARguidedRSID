@@ -1,0 +1,46 @@
+seed: 42
+mode: hybrid  # hybrid | e2e | modular
+run_dir: /kaggle/working/runs/sar_gray_color
+device: auto
+data:
+  root: /kaggle/input/datasets/markosumire/mrshaze/MRSHaze
+  val_fraction: 0.1
+  crop_size: 256
+  sar_channels: 1
+  sar_scale: null  # null: unsigned integer PNGs divided by dtype maximum
+  sar_log1p: false  # false for already rendered/log-scaled SAR PNGs
+model:
+  width: 32
+  depth: 2
+  sar_channels: 1
+  use_sar: true
+  use_structure_features: true
+train:
+  gray_epochs: 10
+  color_epochs: 10
+  joint_epochs: 80
+  batch_size: 4
+  num_workers: 2
+  lr: 0.0002
+  min_lr: 0.000001
+  gray_joint_lr_scale: 0.5
+  weight_decay: 0.0001
+  warmup_epochs: 2
+  accumulation_steps: 1
+  grad_clip: 1.0
+  amp: true
+  sar_dropout: 0.1
+  teacher_start: 0.5
+  val_every: 1
+  max_train_batches: null
+  max_val_images: null
+loss:
+  gray: 1.0
+  gray_ssim: 0.2
+  edge: 0.1
+  rgb: 1.0
+  chroma: 0.5
+  rgb_ssim: 0.2
+  frequency: 0.05
+  gate: 0.05
+  gate_difference_scale: 0.25
