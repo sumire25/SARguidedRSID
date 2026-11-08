@@ -1,0 +1,17 @@
+{
+  "id": "markosumire/exp1-freq-decoupled",
+  "title": "exp1-freq-decoupled",
+  "code_file": "run_exp1.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "true",
+  "dataset_sources": [
+    "markosumire/mrshaze"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

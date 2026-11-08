@@ -95,6 +95,17 @@ def test_no_sar_ablation():
     assert torch.count_nonzero(a['haze']) == 0
 
 
+def test_sar_frequency_decoupling():
+    model = SARGrayColor(width=4, depth=1, use_sar=True, sar_frequency_mode='high_only').train()
+    hazy = torch.rand(2, 3, 16, 16, requires_grad=True)
+    sar = torch.rand(2, 1, 16, 16, requires_grad=True)
+    out = model(hazy, sar)
+    loss = out['rgb'].sum() + out['gray'].sum()
+    loss.backward()
+    assert sar.grad is not None and torch.isfinite(sar.grad).all()
+    assert torch.isfinite(out['rgb']).all()
+
+
 def test_strict_pairing_and_split(dataset_root):
     records = paired_records(dataset_root, 'train')
     a, b, manifest = make_split(records, 0.25, 42)

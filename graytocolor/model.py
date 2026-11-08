@@ -93,10 +93,29 @@ class QualityFusion(nn.Module):
         return optical + haze * refined, haze
 
 
+class LaplacianHighPass(nn.Module):
+    """Extract zero-mean high-frequency details from SAR using a normalized Gaussian kernel."""
+    def __init__(self, channels=1, kernel_size=5, sigma=1.5):
+        super().__init__()
+        k = torch.arange(kernel_size) - kernel_size // 2
+        gauss_1d = torch.exp(-k.float()**2 / (2 * sigma**2))
+        gauss_2d = (gauss_1d[:, None] * gauss_1d[None, :])
+        gauss_2d = (gauss_2d / gauss_2d.sum()).view(1, 1, kernel_size, kernel_size)
+        self.register_buffer('kernel', gauss_2d.repeat(channels, 1, 1, 1))
+        self.pad = kernel_size // 2
+
+    def forward(self, x):
+        low = F.conv2d(x, self.kernel.to(dtype=x.dtype, device=x.device),
+                       padding=self.pad, groups=x.shape[1])
+        return x - low
+
+
 class StructureNet(nn.Module):
-    def __init__(self, widths, depth, sar_channels, use_sar):
+    def __init__(self, widths, depth, sar_channels, use_sar, sar_frequency_mode='all'):
         super().__init__()
         self.use_sar = use_sar
+        self.sar_frequency_mode = sar_frequency_mode
+        self.high_pass = LaplacianHighPass(sar_channels) if (use_sar and sar_frequency_mode == 'high_only') else None
         self.optical_stem = nn.Conv2d(3, widths[0], 3, padding=1)
         self.sar_stem = nn.Conv2d(sar_channels, widths[0], 3, padding=1)
         self.optical_blocks = nn.ModuleList([blocks(w, depth) for w in widths])
@@ -116,7 +135,11 @@ class StructureNet(nn.Module):
 
     def forward(self, hazy, sar):
         x = self.optical_stem(hazy)
-        s = self.sar_stem(sar) if self.use_sar else None
+        if self.use_sar:
+            s_in = self.high_pass(sar) if self.high_pass is not None else sar
+            s = self.sar_stem(s_in)
+        else:
+            s = None
         features, masks = [], []
         for i, optical_block in enumerate(self.optical_blocks):
             x = optical_block(x)
@@ -180,13 +203,14 @@ class ColorNet(nn.Module):
 
 class SARGrayColor(nn.Module):
     def __init__(self, width=32, depth=2, sar_channels=1, use_sar=True,
-                 use_structure_features=True):
+                 use_structure_features=True, sar_frequency_mode='all'):
         super().__init__()
         if width < 4 or depth < 1 or sar_channels < 1:
             raise ValueError('width >= 4, depth >= 1, sar_channels >= 1 required')
         self.sar_channels = sar_channels
+        self.sar_frequency_mode = sar_frequency_mode
         widths = [width, width * 2, width * 4]
-        self.structure = StructureNet(widths, depth, sar_channels, use_sar)
+        self.structure = StructureNet(widths, depth, sar_channels, use_sar, sar_frequency_mode)
         self.colorizer = ColorNet(widths, depth, use_structure_features)
 
     def forward(self, hazy, sar, detach_structure=False, teacher_gray=None,
