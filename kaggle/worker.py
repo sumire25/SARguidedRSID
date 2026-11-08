@@ -107,8 +107,8 @@ def run_negative_evaluation(repo_dir, weights_path, data_root, output_dir, devic
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-url", default="https://github.com/sumire25/SARguidedRSID.git")
-    parser.add_argument("--branch", default="main")
-    parser.add_argument("--config", default="configs/baseline.yaml")
+    parser.add_argument("--branch", default="exp1-freq-decoupled")
+    parser.add_argument("--config", default="configs/exp1_freq_decoupled.yaml")
     parser.add_argument("--data-root", default=None)
     parser.add_argument("--repo-dir", default="/kaggle/working/SARguidedRSID")
     parser.add_argument("--device", default="cuda")
@@ -130,12 +130,19 @@ def main():
     config_path = repo_dir / args.config
     if not config_path.is_file():
         raise FileNotFoundError(f"Config not found: {config_path}")
-    print(f"Using configuration: {config_path}", flush=True)
+    
+    import yaml
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    cfg["data"]["root"] = str(data_root)
+    run_dir = Path(cfg.get("run_dir", f"/kaggle/working/runs/{Path(args.config).stem}"))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    cfg["run_dir"] = str(run_dir)
+    with open(config_path, "w") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    print(f"Using configuration: {config_path} with data root {data_root}", flush=True)
 
     # 4. Execute training
-    run_dir = Path("/kaggle/working/runs") / Path(args.config).stem
-    run_dir.mkdir(parents=True, exist_ok=True)
-
     if not args.skip_train:
         print("\n--- Starting Training ---", flush=True)
         train_cmd = [
