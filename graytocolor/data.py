@@ -115,11 +115,12 @@ def load_sar(path, channels=1, scale=None, log1p=False):
 
 class MRSHazeDataset(Dataset):
     def __init__(self, records, crop_size=None, augment=False, sar_channels=1,
-                 sar_scale=None, sar_log1p=False):
+                 sar_scale=None, sar_log1p=False, clean_prob=0.0):
         self.records = records
         self.crop_size = crop_size
         self.augment = augment
         self.sar_options = (sar_channels, sar_scale, sar_log1p)
+        self.clean_prob = clean_prob
         if not records:
             raise ValueError('Empty dataset')
         if crop_size is not None and crop_size < 8:
@@ -153,7 +154,12 @@ class MRSHazeDataset(Dataset):
             images = {k: torch.rot90(x, turns, (-2, -1)) for k, x in images.items()}
             if flip:
                 images = {k: x.flip(-1) for k, x in images.items()}
-        return {**images, 'id': record['id']}
+        is_clean = 0.0
+        if self.augment and self.clean_prob > 0 and 'gt' in images:
+            if random.random() < self.clean_prob:
+                images['hazy'] = images['gt'].clone()
+                is_clean = 1.0
+        return {**images, 'id': record['id'], 'is_clean': torch.tensor(is_clean, dtype=torch.float32)}
 
 
 def dataset_options(config):

@@ -99,7 +99,8 @@ def train(config, resume=None, init_weights=None, stop_after_epoch=None):
     (run_dir / 'config.yaml').write_text(yaml.safe_dump(config, sort_keys=False))
     t = config['train']
     train_ds = MRSHazeDataset(train_records, crop_size=config['data']['crop_size'],
-                             augment=True, **dataset_options(config))
+                             augment=True, clean_prob=t.get('clean_prob', 0.0),
+                             **dataset_options(config))
     if t['max_val_images']:
         val_records = val_records[:t['max_val_images']]
     # Validation uses whole native-resolution images, never random crops.
@@ -214,6 +215,7 @@ def train(config, resume=None, init_weights=None, stop_after_epoch=None):
                 return
             hazy, sar, gt = [batch[k].to(device, non_blocking=True)
                              for k in ('hazy', 'sar', 'gt')]
+            is_clean = batch['is_clean'].to(device, non_blocking=True) if 'is_clean' in batch else None
             available = torch.ones(hazy.shape[0], 1, 1, 1, device=device)
             if config['model']['use_sar'] and t['sar_dropout']:
                 available = (torch.rand_like(available) >= t['sar_dropout']).to(sar.dtype)
@@ -228,7 +230,7 @@ def train(config, resume=None, init_weights=None, stop_after_epoch=None):
                                teacher_gray=rgb_to_ycbcr(gt)[:, :1] if teacher_ratio else None,
                                teacher_ratio=teacher_ratio, structure_only=phase == 'gray')
                 loss, terms = RestorationLoss(config['loss'], config['model']['use_sar'])(
-                    output, hazy, gt, phase, sar_available=available)
+                    output, hazy, gt, phase, sar_available=available, is_clean=is_clean)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f'Nonfinite loss at epoch {epoch+1}, batch {batch_index+1}')
             # Scale the final incomplete accumulation group by its real size.

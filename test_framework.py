@@ -295,3 +295,19 @@ def test_training_resume_and_inference(dataset_root,tmp_path):
     from evaluate import evaluate
     result = evaluate(tmp_path/'predictions'/'rgb',dataset_root/'test'/'GT',tmp_path/'evaluated','cpu')
     assert result['images']==3
+
+
+def test_identity_regularization():
+    weights = {'gray': 1.0, 'gray_ssim': 0.2, 'edge': 0.1, 'rgb': 1.0, 'chroma': 0.5,
+               'rgb_ssim': 0.2, 'frequency': 0.05, 'gate': 0.05, 'gate_difference_scale': 0.25,
+               'identity': 0.5}
+    loss_fn = RestorationLoss(weights, use_sar=True)
+    out = {'gray': torch.rand(2, 1, 16, 16),
+           'rgb': torch.rand(2, 3, 16, 16),
+           'haze_pyramid': [torch.rand(2, 1, 16, 16)]}
+    hazy = torch.rand(2, 3, 16, 16)
+    gt = torch.rand(2, 3, 16, 16)
+    is_clean = torch.tensor([1.0, 0.0])
+    loss, terms = loss_fn(out, hazy, gt, phase='joint', is_clean=is_clean)
+    assert 'identity' in terms and terms['identity'] > 0
+    assert torch.isfinite(loss)

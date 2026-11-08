@@ -1,0 +1,17 @@
+{
+  "id": "markosumire/exp2-identity-reg",
+  "title": "exp2-identity-reg",
+  "code_file": "worker.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "true",
+  "dataset_sources": [
+    "markosumire/mrshaze"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

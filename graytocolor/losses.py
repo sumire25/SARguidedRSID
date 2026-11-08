@@ -25,7 +25,7 @@ class RestorationLoss(nn.Module):
         self.weights = weights
         self.use_sar = use_sar
 
-    def forward(self, output, hazy, target, phase='joint', sar_available=None):
+    def forward(self, output, hazy, target, phase='joint', sar_available=None, is_clean=None):
         # All reconstruction terms are computed in fp32, even under AMP.
         with torch.autocast(device_type=target.device.type, enabled=False):
             target = target.float()
@@ -59,5 +59,13 @@ class RestorationLoss(nn.Module):
                 terms['rgb_ssim'] = (1-ssim(rgb, target)).mean()
                 if self.weights['frequency']:
                     terms['frequency'] = frequency_loss(rgb, target)
-            total = sum(self.weights[name] * value for name, value in terms.items())
+            if self.weights.get('identity', 0.0) > 0 and is_clean is not None:
+                clean_mask = is_clean.float().view(-1, 1, 1, 1)
+                if clean_mask.any():
+                    pred_rgb = output['rgb'].float()
+                    diff = (pred_rgb - hazy.float()).abs() * clean_mask
+                    terms['identity'] = diff.sum() / (clean_mask.sum() * diff.shape[1] * diff.shape[2] * diff.shape[3]).clamp_min(1)
+                else:
+                    terms['identity'] = gray.new_zeros(())
+            total = sum(self.weights[name] * value for name, value in terms.items() if name in self.weights)
         return total, {name: value.detach().item() for name, value in terms.items()}
